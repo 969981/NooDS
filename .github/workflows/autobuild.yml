@@ -1,9 +1,9 @@
 name: Automatic Builds
 
+# Legacy upstream multi-platform workflow retained for manual builds only.
+# The separate upstream-sync-release workflow handles automated snapshots.
 on:
-  push:
-    branches:
-    - master
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -154,6 +154,7 @@ jobs:
         path: noods.vpk
 
   update-release:
+    if: false # Disable legacy destructive rolling-release deletion.
     runs-on: ubuntu-latest
     needs: [build-windows, build-mac, build-linux, build-android, build-ios, build-switch, build-wiiu, build-vita]
     steps:
