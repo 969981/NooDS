@@ -1,0 +1,273 @@
+name: Sync NooDS upstream and publish desktop snapshots
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/upstream-sync-release.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: noods-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Mirror canonical Hydr8gon/NooDS master
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.sync.outputs.sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      build: ${{ steps.sync.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Check upstream and fast-forward isolated source branch
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          upstream="https://github.com/Hydr8gon/NooDS.git"
+          sha="$(timeout 90 git ls-remote --exit-code "$upstream" refs/heads/master | awk 'NR==1 {print $1}')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Cannot resolve official upstream master."
+            exit 1
+          fi
+
+          previous="$(git ls-remote origin refs/heads/upstream-master | awk 'NR==1 {print $1}')"
+          if [[ "$previous" != "$sha" ]]; then
+            git fetch --no-tags "$upstream" refs/heads/master
+            test "$(git rev-parse FETCH_HEAD)" = "$sha"
+            if [[ -n "$previous" ]]; then
+              git fetch --no-tags origin refs/heads/upstream-master
+              if ! git merge-base --is-ancestor "$previous" "$sha"; then
+                echo "::error::Upstream history is not a fast-forward; source mirror was not rewritten."
+                exit 1
+              fi
+            fi
+            git push origin "$sha:refs/heads/upstream-master"
+            echo "Mirrored upstream $sha"
+          else
+            echo "Already synchronized at $sha"
+          fi
+
+          tag="noods-upstream-${sha:0:12}"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "This SHA was already released."
+          elif [[ "$previous" == "$sha" && "${{ github.event_name }}" == "schedule" ]]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged: scheduled checks do not repeatedly build a failed SHA."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Preparing all desktop builds from $sha"
+          fi
+          printf 'Upstream: %s\nCommit: %s\nRelease: %s\n' "$upstream" "$sha" "$tag" >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    name: Windows x64 (MSYS2 UCRT64)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Set up MSYS2 and dependencies
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git make zip
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-wxwidgets3.3-msw
+            mingw-w64-ucrt-x86_64-portaudio
+            mingw-w64-ucrt-x86_64-jbigkit
+      - name: Compile using official Makefile
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          make -j$(nproc)
+          test -s noods.exe
+          strip noods.exe
+      - name: Package executable, license and readme
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path 'dist/windows' | Out-Null
+          Copy-Item 'noods.exe' 'dist/windows/'
+          Copy-Item 'LICENSE' 'dist/windows/'
+          Copy-Item 'README.md' 'dist/windows/'
+          Compress-Archive -Path 'dist/windows/*' -DestinationPath "dist/NooDS-$env:RELEASE_TAG-Windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noods-windows-x64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux x64 Flatpak (official recipe)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install Flatpak SDK
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          sudo flatpak install -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+      - name: Build using upstream Flatpak target
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global protocol.file.allow always
+          make flatpak -j$(nproc)
+          test -s noods.flatpak
+      - name: Copy bundle into release package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          mkdir -p dist
+          cp noods.flatpak "dist/NooDS-$RELEASE_TAG-Linux-x64.flatpak"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noods-linux-x64
+          path: dist/*.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macOS DMG (upstream wxWidgets 3.3.2)
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+      - name: Install Nix (upstream toolchain)
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-25.05-darwin
+      - name: Compile wxWidgets from upstream pinned version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --recursive --depth 1 --branch v3.3.2 https://github.com/wxWidgets/wxWidgets.git
+          cd wxWidgets
+          ./configure --disable-sys-libs --disable-shared --disable-tests --without-libcurl
+          make -j$(sysctl -n hw.logicalcpu)
+          sudo make install
+      - name: Compile application with upstream Makefile
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix-shell -p portaudio libGL pkg-config --run "make -j$(sysctl -n hw.logicalcpu)"
+          test -s noods
+      - name: Bundle DMG with upstream script
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+        run: |
+          set -euo pipefail
+          meta/mac-bundle.sh --dmg
+          test -s NooDS.dmg
+          mkdir -p dist
+          cp NooDS.dmg "dist/NooDS-$RELEASE_TAG-macOS.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: noods-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish complete three-platform snapshot
+    needs: [sync, windows, linux, macos]
+    if: >-
+      needs.sync.outputs.build == 'true' &&
+      needs.windows.result == 'success' &&
+      needs.linux.result == 'success' &&
+      needs.macos.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: noods-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and publish immutable snapshot
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+          SOURCE_SHA: ${{ needs.sync.outputs.sha }}
+        run: |
+          set -euo pipefail
+          cd dist
+          test -s "NooDS-$RELEASE_TAG-Windows-x64.zip"
+          test -s "NooDS-$RELEASE_TAG-Linux-x64.flatpak"
+          test -s "NooDS-$RELEASE_TAG-macOS.dmg"
+          sha256sum "NooDS-$RELEASE_TAG-Windows-x64.zip" \
+            "NooDS-$RELEASE_TAG-Linux-x64.flatpak" \
+            "NooDS-$RELEASE_TAG-macOS.dmg" > SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          cat > release-notes.md <<EOF
+          Unofficial NooDS snapshot compiled from upstream commit \`$SOURCE_SHA\`.
+
+          Official source: https://github.com/Hydr8gon/NooDS
+
+          - Windows x64: executable ZIP (MSYS2 UCRT64).
+          - Linux x64: Flatpak.
+          - macOS: DMG based on the upstream wxWidgets/mac bundle script.
+          - SHA256SUMS.txt: SHA-256 checksums.
+
+          Packages are from the same upstream source revision. Compilation alone does not confirm runtime compatibility.
+          These builds are separate from the upstream developer's Rolling Release.
+          No games, system firmware, or BIOS images are included.
+          EOF
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG"
+          else
+            gh release create "$RELEASE_TAG" \
+              "NooDS-$RELEASE_TAG-Windows-x64.zip" \
+              "NooDS-$RELEASE_TAG-Linux-x64.flatpak" \
+              "NooDS-$RELEASE_TAG-macOS.dmg" SHA256SUMS.txt \
+              --target "$SOURCE_SHA" \
+              --title "NooDS $RELEASE_TAG" --prerelease --notes-file release-notes.md
+          fi
